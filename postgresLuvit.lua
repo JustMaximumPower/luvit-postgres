@@ -37,12 +37,12 @@ local conPool = {}
 
 local LuvPostgres = Emitter:extend()
 
-function LuvPostgres:initialize()
+function LuvPostgres:initialize(coninfo)
     if #conPool > 0 then
         self.con = conPool[#conPool]
         conPool[#conPool] = nil
     else
-        self.con = postgres.newAsync("host=localhost dbname=MaximumSpace user=game password=game")
+        self.con = postgres.newAsync(coninfo)
     end
     
     --[[ This is an dirty hack to update the connection state. The correct
