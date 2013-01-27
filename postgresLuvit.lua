@@ -30,17 +30,32 @@ local table = require("table")
 postgres.init()
 
 --Timeout for the poll timer
-local POLLTIMER_INTERVALL = 20
+local POLLTIMER_INTERVALL = 10
 
---Pool of unused connections
+--[[Map of pool of unused connections
+    the connection string is used as key to the map
+    this means that connections are only sheard if the conection 
+    string is the same
+]]
 local conPool = {}
+
 
 local LuvPostgres = Emitter:extend()
 
+
+--[[Constructor the coninfo string is passed to PQconnectStart
+    and is used as key for connection pooling.
+
+    Emits:
+	- "established" if the connection is completed.
+	- "error" if an error occurs 
+]] 
 function LuvPostgres:initialize(coninfo)
-    if #conPool > 0 then
-        self.con = conPool[#conPool]
-        conPool[#conPool] = nil
+    local pool = conPool[coninfo]
+    self.coninfo = coninfo    
+    if pool and #pool > 0 then
+        self.con = pool[#pool]
+        pool[#pool] = nil
     else
         self.con = postgres.newAsync(coninfo)
     end
@@ -62,6 +77,16 @@ function LuvPostgres:initialize(coninfo)
     end)
 end
 
+
+--[[Sends a query to the sql server
+
+    Emits:
+	- "result" when a (partial) result returns
+	  the first argument is a table with the data
+	  The format of the data is described in postgresffi.lua getAvailable()
+	- "finished" when the end of the query is reached.
+	- "error" if an error occurs 
+]]
 function LuvPostgres:sendQuery(query)
     if not self.established then
         slef:emit("error", "Can't send query. Connection is not established!")
@@ -77,7 +102,7 @@ function LuvPostgres:sendQuery(query)
         if self.con then
             local ok, ready = pcall(self.con.readReady, self.con)
             if not ok then
-                self:emit("error", "")
+                self:emit("error", ready)
             elseif ready then
                 local ok, result , status = pcall(self.con.getAvailable, self.con)
                 if not ok then
@@ -108,22 +133,33 @@ function LuvPostgres:sendQuery(query)
 end
 
 
+--[[Returns a escaped version of the string than can be savely
+    used in a query without danger of SQL injection or nil and 
+    a message on error
+]]
 function LuvPostgres:escape(query)
     local ok, value = pcall(self.con.escape, self.con, query)
     if ok then
         return value
     end
-    self:emit("error", value)
+    return nil, value
 end
 
 
+--[[ Releases the connection associated with the object
+     the be insertet into the conection pool
+]]
 function LuvPostgres:release()
     if self.con.queryInProcess then
         p("connection is in a Bad state")
         p(self.con)
     else
         if self.established then
-            table.insert(conPool, self.con)
+            local pool = conPool[self.coninfo]
+            if not pool then
+                pool = {}
+            end
+            table.insert(pool, self.con)
         end
         self.con = nil
         self.watcher = nil
