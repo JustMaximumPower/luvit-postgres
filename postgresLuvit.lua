@@ -24,42 +24,37 @@
 
 local postgres = require("postgresffi")
 local timer = require('timer')
-local Emitter = require('core').Emitter
+local object = require('core').Object
 local table = require("table")
 
-postgres.init()
+
+--[[Loads the library at POSTGRESQL_LIBRARY_PATH if not nil 
+    defaults to "/usr/lib/libpq.so.5".
+    
+    To use this set the global with a string pointing at the right 
+    path befor requiring this library.
+]]
+postgres.init(POSTGRESQL_LIBRARY_PATH)
+
 
 --Timeout for the poll timer
-local POLLTIMER_INTERVALL = 10
-
---[[Map of pool of unused connections
-    the connection string is used as key to the map
-    this means that connections are only sheard if the conection 
-    string is the same
-]]
-local conPool = {}
+local POLLTIMER_INTERVALL = 15
 
 
-local LuvPostgres = Emitter:extend()
+local LuvPostgres = object:extend()
 
-
---[[Constructor the coninfo string is passed to PQconnectStart
-    and is used as key for connection pooling.
-
-    Emits:
-	- "established" if the connection is completed.
-	- "error" if an error occurs 
-]] 
-function LuvPostgres:initialize(coninfo)
-    local pool = conPool[coninfo]
-    self.coninfo = coninfo    
-    if pool and #pool > 0 then
-        self.con = pool[#pool]
-        pool[#pool] = nil
-    else
-        self.con = postgres.newAsync(coninfo)
+local function callIfNotNil(callback, ...)
+    if callback ~= nil then
+        callback(...)
     end
-    
+end
+
+--[[Constructor the coninfo string is passed to PQconnectStart.
+]] 
+function LuvPostgres:initialize(coninfo, callback)
+
+   self.con = postgres.newAsync(coninfo)
+
     --[[ This is an dirty hack to update the connection state. The correct
          solution should watch the socket descriptor and update upon 
          network activity    
@@ -69,27 +64,96 @@ function LuvPostgres:initialize(coninfo)
         if 0 == state then
             timer.clearTimer(self.watcher)
             self.established = true
-            self:emit("established")
+            callIfNotNil(callback)
         elseif 1 == state then
             timer.clearTimer(self.watcher)
-            self:emit("error", self.con:getError())
+            callIfNotNil(callback, self.con:getError())
         end
     end)
 end
 
 
+-- internal function to retrieve a fragment of the result 
+local function getFragment(connection)
+    local ok, ready = pcall(connection.readReady, connection)
+    
+    if not ok then
+        --error occured
+        return nil, ready
+    elseif not ready then
+        --no input ready
+        return {}
+    end
+    
+    local ok, result , status = pcall(connection.getAvailable, connection)
+    if not ok then
+        --error occured
+        return nil, ready
+    end
+    
+    local isOver = false
+    if status <= 7 then
+        --query is over 
+        if connection:getAvailable() ~= nil then
+            --internal error occured
+            return nil, "Internal binding error. Query is not over!"
+        end
+        
+        if status == 5 or status == 7 then 
+            --error occured
+            return nil, connection:getError()
+        end
+        isOver = true
+    end
+
+    return result, isOver
+end
+
 --[[Sends a query to the sql server
 
-    Emits:
-	- "result" when a (partial) result returns
-	  the first argument is a table with the data
-	  The format of the data is described in postgresffi.lua getAvailable()
-	- "finished" when the end of the query is reached.
-	- "error" if an error occurs 
+    Callback is called with error and the entire resultset.
+    Read postgresffi.getAvailable for a description of the format.
 ]]
-function LuvPostgres:sendQuery(query)
+function LuvPostgres:sendQuery(query, callback)
     if not self.established then
-        slef:emit("error", "Can't send query. Connection is not established!")
+        callIfNotNil(callback, "Can't send query. Connection is not established!")
+        return
+    end
+    self.con:sendQuery(query)
+    
+    local resultAccu = nil
+    --[[ This is an dirty hack to update the connection state. The correct
+         solution should watch the socket descriptor and update upon 
+         network activity    
+    ]]
+    self.watcher = timer.setInterval(POLLTIMER_INTERVALL, function()
+        local result, over = getFragment(self.con)
+
+        if not result then
+            timer.clearTimer(self.watcher)
+            callIfNotNil(callback, over)
+        else
+            if not resultAccu then
+                resultAccu = result
+            else
+                table.foreach(result, function(e) table.insert(resultAccu, e) end)
+            end
+            if over then
+                timer.clearTimer(self.watcher)
+                callIfNotNil(callback, nil, resultAccu)
+            end
+        end
+    end)
+end
+
+--[[Sends a query to the sql server and returns intermediate results
+
+    Callback is called with error and subset of the result and to mark the end a boolean true.
+    Read postgresffi.getAvailable for a description of the format.
+]]
+function LuvPostgres:sendQueryIntermediate(query, callback)
+    if not self.established then
+        callIfNotNil(callback, "Can't send query. Connection is not established!")
         return
     end
     self.con:sendQuery(query)
@@ -99,36 +163,16 @@ function LuvPostgres:sendQuery(query)
          network activity    
     ]]
     self.watcher = timer.setInterval(POLLTIMER_INTERVALL, function()
-        if self.con then
-            local ok, ready = pcall(self.con.readReady, self.con)
-            if not ok then
-                self:emit("error", ready)
-            elseif ready then
-                local ok, result , status = pcall(self.con.getAvailable, self.con)
-                if not ok then
-                    self:emit("error", result)
-                else
-                    if status <= 7 then
-                        timer.clearTimer(self.watcher)
-                        if self.con:getAvailable() ~= nil then
-                            self:emit("error", "Internal binding error. Query is not over!")
-                            return
-                        end
-                        
-                        if status == 5 or status == 7 then 
-                            self:emit("error", self.con:getError())
-                        else
-                            self:emit("result", result)
-                            self:emit("finished")
-                        end
-                    else
-                        self:emit("result", result)
-                    end
-                end
-            end
-         else
+        local result, over = getFragment(self.con)
+        if not result then
             timer.clearTimer(self.watcher)
-         end
+            callIfNotNil(callback, over)
+        else
+            if over then
+                timer.clearTimer(self.watcher)
+            end        
+            callIfNotNil(callback, nil, resultAccu, over)
+        end
     end)
 end
 
@@ -145,26 +189,6 @@ function LuvPostgres:escape(query)
     return nil, value
 end
 
-
---[[ Releases the connection associated with the object
-     the be insertet into the conection pool
-]]
-function LuvPostgres:release()
-    if self.con.queryInProcess then
-        p("connection is in a Bad state")
-        p(self.con)
-    else
-        if self.established then
-            local pool = conPool[self.coninfo]
-            if not pool then
-                pool = {}
-            end
-            table.insert(pool, self.con)
-        end
-        self.con = nil
-        self.watcher = nil
-    end
-end
 
 
 return LuvPostgres
