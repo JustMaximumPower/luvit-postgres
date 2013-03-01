@@ -38,7 +38,7 @@ postgres.init(POSTGRESQL_LIBRARY_PATH)
 
 
 --Timeout for the poll timer
-local POLLTIMER_INTERVALL = 15
+local POLLTIMER_INTERVALL = 5
 
 
 local LuvPostgres = object:extend()
@@ -121,7 +121,7 @@ function LuvPostgres:sendQuery(query, callback)
     end
     self.con:sendQuery(query)
     
-    local resultAccu = nil
+    local resultAccu = {}
     --[[ This is an dirty hack to update the connection state. The correct
          solution should watch the socket descriptor and update upon 
          network activity    
@@ -133,12 +133,13 @@ function LuvPostgres:sendQuery(query, callback)
             timer.clearTimer(self.watcher)
             callIfNotNil(callback, over)
         else
-            if not resultAccu then
-                resultAccu = result
-            else
-                table.foreach(result, function(e) table.insert(resultAccu, e) end)
+            local cntRow = #result
+            for i = 1, cntRow do
+                table.insert(resultAccu, result[i])
             end
+
             if over then
+                resultAccu[0] = result[0]
                 timer.clearTimer(self.watcher)
                 callIfNotNil(callback, nil, resultAccu)
             end
@@ -171,7 +172,7 @@ function LuvPostgres:sendQueryIntermediate(query, callback)
             if over then
                 timer.clearTimer(self.watcher)
             end        
-            callIfNotNil(callback, nil, resultAccu, over)
+            callIfNotNil(callback, nil, result, over)
         end
     end)
 end
